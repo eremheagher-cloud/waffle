@@ -1,0 +1,322 @@
+
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: "Instance Number (1-10)"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    env:
+      RDP_USER: Rafael
+      RDP_PASSWORD: 'P@ssw0rd!'
+      TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize Session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Initializing virtual PC setup..." -ForegroundColor Cyan
+          Write-Host "Instance: ${{ inputs.instance_number }}"
+
+          "INSTANCE_NUMBER=${{ inputs.instance_number }}" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          "SESSION_START=$(Get-Date -Format o)" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: System Information
+        shell: pwsh
+        run: |
+          Write-Host "=== SYSTEM INFORMATION ===" -ForegroundColor Cyan
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture
+
+          Write-Host "`n=== DISK SPACE ===" -ForegroundColor Cyan
+          Get-PSDrive -PSProvider FileSystem
+
+          Write-Host "`n=== MEMORY ===" -ForegroundColor Cyan
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object TotalVisibleMemorySize, FreePhysicalMemory
+
+      - name: Configure Remote Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Configuring Remote Desktop..." -ForegroundColor Cyan
+
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "Remote Desktop configuration completed."
+
+      - name: Configure TPM Compatibility Registry
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "Configuring compatibility registry values..." -ForegroundColor Cyan
+
+          $registryPath = 'HKLM:\SYSTEM\Setup\MoSetup'
+          if (-not (Test-Path $registryPath)) {
+            New-Item -Path $registryPath -Force | Out-Null
+          }
+
+          New-ItemProperty `
+            -Path $registryPath `
+            -Name 'AllowUpgradesWithUnsupportedTPMOrCPU' `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          Write-Host "Compatibility registry value configured."
+          Write-Host "These settings do not convert the runner into Windows 11."
+
+      - name: Create Local User
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $username = $env:RDP_USER
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser `
+              -Name $username `
+              -Password $password `
+              -Description "Virtual PC user" `
+              -PasswordNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $username -Password $password
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Local user configured: $username" -ForegroundColor Green
+
+      - name: Configure Network
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "Configuring network services..." -ForegroundColor Cyan
+
+          $networkServices = @(
+            "Dhcp",
+            "Dnscache",
+            "NlaSvc",
+            "netprofm"
+          )
+
+          foreach ($service in $networkServices) {
+            try {
+              Set-Service `
+                -Name $service `
+                -StartupType Automatic `
+                -ErrorAction Stop
+
+              Start-Service `
+                -Name $service `
+                -ErrorAction Stop
+            }
+            catch {
+              Write-Warning "Network service ${service}: $($_.Exception.Message)"
+            }
+          }
+
+          Write-Host "`n=== NETWORK ADAPTERS ===" -ForegroundColor Cyan
+          Get-NetAdapter -ErrorAction SilentlyContinue |
+            Select-Object Name, InterfaceDescription, Status, LinkSpeed
+
+          Write-Host "`n=== IP CONFIGURATION ===" -ForegroundColor Cyan
+          Get-NetIPConfiguration -ErrorAction SilentlyContinue
+
+      - name: Configure Audio
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "Configuring audio services..." -ForegroundColor Cyan
+
+          foreach ($service in @("Audiosrv", "AudioEndpointBuilder")) {
+            try {
+              Set-Service -Name $service -StartupType Automatic
+              Start-Service -Name $service
+              Write-Host "Audio service configured: $service"
+            }
+            catch {
+              Write-Warning "Audio service ${service}: $($_.Exception.Message)"
+            }
+          }
+
+      - name: Install and Connect Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Missing TAILSCALE_AUTH_KEY secret. Add it in repository Settings > Secrets and variables > Actions."
+          }
+
+          $installer = Join-Path $env:TEMP 'tailscale-setup.msi'
+          $downloadUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
+
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $installer
+
+          Write-Host "Installing Tailscale..."
+          $process = Start-Process `
+            -FilePath 'msiexec.exe' `
+            -ArgumentList "/i `"$installer`" /qn /norestart" `
+            -Wait `
+            -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            throw "Tailscale installation failed with exit code $($process.ExitCode)."
+          }
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscaleExe)) {
+            throw "Tailscale executable was not found after installation."
+          }
+
+          $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if ($null -ne $service) {
+            Set-Service -Name Tailscale -StartupType Automatic
+            Start-Service -Name Tailscale
+          }
+
+          Write-Host "Connecting to Tailscale..."
+          & $tailscaleExe up "--authkey=$env:TS_AUTHKEY" "--hostname=pc-${{ inputs.instance_number }}" "--accept-dns=true"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale could not connect. Check the authentication key and tailnet permissions."
+          }
+
+          Start-Sleep -Seconds 5
+          $tailscaleIp = & $tailscaleExe ip -4
+
+          if ($LASTEXITCODE -ne 0 -or
+              [string]::IsNullOrWhiteSpace(($tailscaleIp -join '').Trim())) {
+            throw "Could not obtain the Tailscale IPv4 address."
+          }
+
+          $tailscaleIp = ($tailscaleIp | Select-Object -First 1).Trim()
+          "TAILSCALE_IP=$tailscaleIp" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "Tailscale IPv4: $tailscaleIp" -ForegroundColor Green
+
+      - name: Install Google Chrome
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:TEMP 'chrome-installer.exe'
+          $url = 'https://dl.google.com/chrome/install/latest/chrome_installer.exe'
+
+          Write-Host "Downloading Google Chrome..."
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList '/silent /install' `
+            -Wait `
+            -PassThru
+
+          Write-Host "Chrome installer exit code: $($process.ExitCode)"
+
+      - name: Install 7-Zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:TEMP '7zip-installer.exe'
+          $url = 'https://www.7-zip.org/a/7z2409-x64.exe'
+
+          Write-Host "Downloading 7-Zip..."
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList '/S' `
+            -Wait `
+            -PassThru
+
+          Write-Host "7-Zip installer exit code: $($process.ExitCode)"
+
+      - name: Verify Remote Desktop and Network
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host "=== RDP SERVICE ===" -ForegroundColor Cyan
+          Get-Service -Name TermService
+
+          Write-Host "`n=== RDP PORT ===" -ForegroundColor Cyan
+          Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "`n=== TAILSCALE STATUS ===" -ForegroundColor Cyan
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $tailscaleExe) {
+            & $tailscaleExe status
+          }
+
+          Write-Host "`n=== CONNECTION DETAILS ===" -ForegroundColor Cyan
+          Write-Host "Computer: $env:TAILSCALE_IP`:3389"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
+
+      - name: Keep Session Alive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "The runner has a limited lifetime." -ForegroundColor Yellow
+          Write-Host "GitHub Actions will end this job at its timeout."
+
+          $deadline = (Get-Date).AddHours(5)
+          while ((Get-Date) -lt $deadline) {
+            Write-Host "Session active: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            Start-Sleep -Seconds 60
+          }
+
+          Write-Host "Session time limit reached."
+          
